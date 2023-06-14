@@ -1,6 +1,5 @@
 
 from argparse import ArgumentTypeError
-import logging
 from typing import Any, Dict, List, Set, Tuple
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -39,22 +38,38 @@ bcc.y_y(x) # gets value of y for x, but interpolates
     resolution: float = 0.001
     curve: Dict[str, Dict[float, float]] = field(default_factory=lambda: {'x': {}, 'y': {}})
     values: Dict[str, List[float]] = field(default_factory=lambda: {'x': [], 'y': []})
+    rounded: bool = True
 
     def __post_init__(self):
         if not self.curve:
             self.curve = {'x': {}, 'y': {}}
         if len(self.curve['x']) == 0 or len(self.curve['y']) == 0:
-            # degree = len(self.x)
-            x = self.px
-            y = self.py
-            for u in np.arange(0.0, 1.0, self.resolution):
-                xu = (1-u)**3 * x[0] + 3 * u * (1-u)**2 * x[1] + 3 * u**2 * (1-u) * x[2] + u**3 * x[3]
-                yu = (1-u)**3 * y[0] + 3 * u * (1-u)**2 * y[1] + 3 * u**2 * (1-u) * y[2] + u**3 * y[3]
+            self.recalculate()
+    
+    def getDegree(self):
+        return len(self.px)
+    
+    def getRoundDigits(self):
+        return 1 + int(-math.log10(self.resolution))
+
+    def recalculate(self):
+        self.curve = {'x': {}, 'y': {}}
+        x = self.px
+        y = self.py
+        round_digits = self.getRoundDigits()
+        for t in np.arange(0.0, 1.0, self.resolution):
+            mt = 1-t
+            xu = mt**3 * x[0] + 3 * t * mt**2 * x[1] + 3 * t**2 * mt * x[2] + t**3 * x[3]
+            yu = mt**3 * y[0] + 3 * t * mt**2 * y[1] + 3 * t**2 * mt * y[2] + t**3 * y[3]
+            if self.rounded:
+                self.curve['x'][round(xu, round_digits)] = yu
+                self.curve['y'][round(yu, round_digits)] = xu
+            else:
                 self.curve['x'][xu] = yu
                 self.curve['y'][yu] = xu
-            
-            self.values['x'] = sorted(self.curve['x'].keys())
-            self.values['y'] = sorted(self.curve['y'].keys())
+        
+        self.values['x'] = sorted(self.curve['x'].keys())
+        self.values['y'] = sorted(self.curve['y'].keys())
 
     def x_index(self, x):
         return bisect_left(self.values['x'], x)
@@ -271,7 +286,9 @@ class Animation(Buildable):
         transition: Transition | None = None,
         sentiments: Dict[str, float] | None = None,
         tags: Set[str] | None = None,
-        hist_max = 4, **kwargs
+        weight = 1.0,
+        hist_max = 4,
+        **kwargs,
     ):
         self.typ = typ
         self.transition = transition
@@ -286,7 +303,7 @@ class Animation(Buildable):
         self.hist_max = hist_max
         self.kwargs = kwargs
         
-        self.weight = 1.0
+        self.weight = weight
         self.time_multipliers = {
             'duration': 1.0,
             'interval': 1.0,
@@ -458,13 +475,15 @@ class AnimationStates:
         self,
         animations: Dict[str, Animation | Dict] | None = None,
         transitions: Dict[str, Dict[str, Transition | Tuple[Dict, Dict]]] | None = None,
-        state_changes = None,
+        state_changes: Dict[str, Changer] | None = None,
         sentiments_args = None,
+        sentiments: Dict[str, float] | None = None,
         **kwargs
     ):
         if not animations:
             animations = {}
 
+        self.sentiment_animations: Dict[str, Dict[str, Animation]] = {}
         self.animations: Dict[str, Animation] = {}
         for animation_name, a in animations.items():
             if isinstance(a, Animation):
@@ -473,7 +492,16 @@ class AnimationStates:
             else:
                 logger.info(f"Building   {animation_name}")
                 self.animations[animation_name] = Animation.build(animation_name, **a)
+            if animation_name.startswith('sentiment_'):
+                sentiment = animation_name.split('_')[1]
+                if sentiment not in self.sentiment_animations:
+                    self.sentiment_animations[sentiment] = {}
+                
+                self.sentiment_animations[sentiment][animation_name] = self.animations[animation_name]
+                self.animations[animation_name].weight = 0.0
         
+        logger.info(f"self.sentiment_animations {self.sentiment_animations}")
+
         transitions = transitions or {}
         tr: Dict[str, Dict[str, Transition]] = {k: {} for k in transitions.keys()}
         for k in transitions.keys():
@@ -530,7 +558,7 @@ class AnimationStates:
                     break
 
         self.sentiments_args = sentiments_args or {}
-        self.sentiments = {}
+        self.sentiments: Dict[str, float] = sentiments or {}
     
         self.transitioning: Dict[str, Dict[str, Dict[str, str]]] = {}
         self.transitions_active: Dict[str, Transition] = {}
@@ -616,6 +644,27 @@ class AnimationStates:
                 self.playing_types[typ].add(animation_name)
                 logger.info(f"self.playing_types[{typ}] = {self.playing_types[typ]}")
     
+
+    def change_sentiments(self, sentiments):
+        # get which sentiments are new, which are not in the new, and which remain
+        new = set(sentiments.keys()) - set(self.sentiments.keys()) 
+        removed = set(self.sentiments.keys()) - set(sentiments.keys())
+        common = set(self.sentiments.keys()).intersection(set(sentiments.keys()))
+
+        for s_name in removed:
+            if s_name in self.sentiment_animations.keys():
+                for a_name, a in self.sentiment_animations[s_name].items():
+                    logger.info(f"Sentiment removed animation {a_name}")
+                    a.weight = 0.0
+
+        for s_name in [*new, *common]:
+            if s_name in self.sentiment_animations.keys():
+                for a_name, a in self.sentiment_animations[s_name].items():
+                    logger.info(f"Sentiment changed animation {a_name}.weight = {sentiments[s_name]}")
+                    a.weight = sentiments[s_name]
+
+        self.sentiments = sentiments
+
     def update(self, time_counter = None):
         elapsed, time_counter = self.updateElapsed(time_counter)
 
@@ -640,7 +689,6 @@ class AnimationStates:
             for animation_name, transition_id in t['out'].items():
                 weight = getW(transition_id)
                 weight_new = 1.0 - weight
-                logger.info(f"{animation_name} = {weight_new}")
                 self.getAnimation(animation_name).weight = weight_new
                 if weight_new <= 0.0:
                     # Finished transition
@@ -666,6 +714,13 @@ class AnimationStates:
             if not self.transitioning[typ]['out'].keys() and not self.transitioning[typ]['in'].keys():
                 logger.info(f"Finished all transitions {typ}")
                 del self.transitioning[typ]
+                to_del_t = []
+                for t_id, t in self.transitions_active.items():
+                    if t.cd.getRemaining(time_counter) <= 0:
+                        to_del_t.append(t_id)
+                for t_id in to_del_t:
+                    del self.transitions_active[t_id]
+
 
 
         for name, a in self.animations.items():
