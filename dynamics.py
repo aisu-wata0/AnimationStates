@@ -1,9 +1,22 @@
 
+from abc import abstractmethod
 import numpy as np
 import math
 
+class Dynamics:
+	@abstractmethod
+	def update(self, T: float, x: np.ndarray, xd: np.ndarray | None = None) -> np.ndarray:
+		"""
+		T: seconds
+		"""
+		pass
 
-class SecondOrderDynamics:
+	@abstractmethod
+	def init(self, x0: np.ndarray):
+		pass
+
+
+class SecondOrderDynamics(Dynamics):
 	# previous input
 	xp: np.ndarray
 	# # state
@@ -17,7 +30,7 @@ class SecondOrderDynamics:
 	k2: float = 0.0
 	k3: float = 0.0
 
-	def __init__(self, f, z, r, x0, stabilization: str | None ='k2'):
+	def __init__(self, f, z, r, x0: np.ndarray | None = None, stabilization: str | None ='k2'):
 		"""
 		f: frequency measured in Hz, cycles per second
 		speed at which the system will respond to changes in the input
@@ -52,10 +65,13 @@ class SecondOrderDynamics:
 			self.T_crit *= 0.8
 
 		# Initialize variables
+		if x0:
+			self.init(x0)
+
+	def init(self, x0: np.ndarray):
 		self.xp = x0
 		self.y = x0
 		self.yd = np.zeros(x0.shape)
-
 
 	def update(self, T: float, x: np.ndarray, xd: np.ndarray | None = None) -> np.ndarray:
 		"""
@@ -80,3 +96,15 @@ class SecondOrderDynamics:
 			# Integrate velocity by acceleration
 			self.yd = self.yd + T*(x + k3*xd - self.y - k1*self.yd) / k2
 		return self.y
+
+
+def get_dynamics(dynamics: Dynamics | dict[str, float] | None) -> Dynamics | None:
+	if isinstance(dynamics, Dynamics) or dynamics is None:
+		return dynamics
+	if isinstance(dynamics, dict):
+		if all(k in dynamics for k in ['f', 'z', 'r']):
+			dynamics = SecondOrderDynamics(**dynamics)
+			return dynamics
+	if isinstance(dynamics, str) and not dynamics:
+		return None
+	raise NotImplementedError()
