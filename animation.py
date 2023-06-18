@@ -1,5 +1,6 @@
 
 from argparse import ArgumentTypeError
+from collections import defaultdict
 from typing import Any, Dict, List, Set, Tuple
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -12,12 +13,16 @@ import copy
 import numpy as np
 from bisect import bisect_left
 
+from AnimationStates.dynamics import Dynamics, SecondOrderDynamics, get_dynamics
+
 from python_utils_aisu.utils import Buildable, Cooldown, CooldownVarU, get_random_string
 from python_utils_aisu import utils
 
 logger = utils.loggingGetLogger(__name__)
 logger.setLevel('INFO')
 
+epsilon = np.finfo(float).eps
+epsilon_f = float(np.finfo(float).eps)
 
 @dataclass
 class BezierCurveCubic:
@@ -45,10 +50,10 @@ bcc.y_y(x) # gets value of y for x, but interpolates
             self.curve = {'x': {}, 'y': {}}
         if len(self.curve['x']) == 0 or len(self.curve['y']) == 0:
             self.recalculate()
-    
+
     def getDegree(self):
         return len(self.px)
-    
+
     def getRoundDigits(self):
         return 1 + int(-math.log10(self.resolution))
 
@@ -67,7 +72,7 @@ bcc.y_y(x) # gets value of y for x, but interpolates
             else:
                 self.curve['x'][xu] = yu
                 self.curve['y'][yu] = xu
-        
+
         self.values['x'] = sorted(self.curve['x'].keys())
         self.values['y'] = sorted(self.curve['y'].keys())
 
@@ -76,7 +81,7 @@ bcc.y_y(x) # gets value of y for x, but interpolates
 
     def x_nearest(self, x):
         index = self.x_index(x)
-        
+
         if index == 0:
             # x is smaller than the smallest precalculated x
             return self.values['x'][0]
@@ -152,7 +157,7 @@ class CurveT_linear_delays(CurveT):
     `y == 0` until `(x, y) == (delay_start, 0)`
 
     then linearly rises until `(x, y) == (delay_end, 1)`
-    
+
     then `y == 1` until the end, i.e. x == 1
     """
     name: str = 'linear_delays'
@@ -168,7 +173,7 @@ class CurveT_linear_delays(CurveT):
         return min(1.0, max(0.0, (x - delay_start) / (delay_end - delay_start)))
 
 @dataclass
-class CurveT_keyframes(CurveT):    
+class CurveT_keyframes(CurveT):
     """
     `keyframes: List of (x, y) keyframe tuples`
 
@@ -181,7 +186,7 @@ class CurveT_keyframes(CurveT):
             return 0.0
         if x >= keyframes[-1][0]:
             return 1.0
-        
+
         for i in range(len(keyframes)-1):
             if keyframes[i][0] <= x <= keyframes[i+1][0]:
                 x1, y1 = keyframes[i]
@@ -190,9 +195,9 @@ class CurveT_keyframes(CurveT):
         return 1.0
 
 @dataclass
-class CurveT_sigmoid(CurveT):    
+class CurveT_sigmoid(CurveT):
     """
-    Sigmoid curve defined by `steepness`. 
+    Sigmoid curve defined by `steepness`.
     The steeper the curve, the more abruptly it transitions from 0 to 1.
     """
     name: str = 'sigmoid'
@@ -202,7 +207,7 @@ class CurveT_sigmoid(CurveT):
 
 
 @dataclass
-class CurveT_bezier(CurveT):    
+class CurveT_bezier(CurveT):
     """
     Cubic Bezier curve defined by two control points.
 
@@ -239,7 +244,7 @@ class Transition:
 
     def doStart(self, time_counter: float):
         return self.cd.doStart(time_counter)
-    
+
     @classmethod
     def build(cls, curve, cd):
         return Transition(
@@ -255,12 +260,18 @@ class AParameters:
         - added together
         - multiplied by a scalar
     """
+    array: np.ndarray
+
+    def __init__(self, array: np.ndarray | None = None):
+        if array is not None:
+            self.array = array
+
     @abstractmethod
     def __add__(self, other: 'AParameters') -> 'AParameters':
         """Addition method, between objects of this class."""
         pass
 
-    @abstractmethod 
+    @abstractmethod
     def __radd__(self, other: 'AParameters') -> 'AParameters':
         """Addition method with reflected operands, between objects of this class."""
         pass
@@ -287,7 +298,7 @@ class Animation(Buildable):
         sentiments: Dict[str, float] | None = None,
         tags: Set[str] | None = None,
         weight = 1.0,
-        hist_max = 4,
+        hist_max = 0,
         **kwargs,
     ):
         self.typ = typ
@@ -302,7 +313,7 @@ class Animation(Buildable):
         self.state_hist: List[Dict[str, Any]] = []
         self.hist_max = hist_max
         self.kwargs = kwargs
-        
+
         self.weight = weight
         self.time_multipliers = {
             'duration': 1.0,
@@ -321,7 +332,7 @@ class Animation(Buildable):
         self.cooldowns['interval_i'] = copy.copy(self.cooldowns['interval'])
         self.init()
 
-    
+
     def __post_init__(self):
         pass
 
@@ -345,39 +356,51 @@ class Animation(Buildable):
 
     def isActive(self):
         return self.weight > 0 and (self.cooldowns['duration_i'].getRemaining() > 0) or self.isContinuous()
-    
+
     def isContinuous(self):
         return not self.interval or self.cooldowns['interval_i'].seconds == 0
-    
+
     def get_weight(self) -> float:
         return self.weight
-    
+
     def get_parameters_w(self) -> AParameters:
         return self.get_parameters() * self.get_weight()
-    
+
     def get(self) -> AParameters:
         return self.get_parameters_w()
-    
-    
+
+
+    def elapsed_seconds(self, time_counter):
+        return self.cooldowns['duration_i'].elapsed(time_counter)
+
     def elapsed_percent(self, time_counter):
-        return min(1.0, self.cooldowns['duration_i'].elapsed_percent(time_counter)) 
-    
+        return min(1.0, self.cooldowns['duration_i'].elapsed_percent(time_counter))
+
     def time_pi_duration(self, time_counter):
         return time_counter * math.pi / self.cooldowns['duration_i'].getDuration()
 
     def state_add(self, state: AParameters, elapsed):
-        self.state_hist.append({
-            'elapsed': elapsed,
-            'state': state,
-        })
-        self.state_hist = self.state_hist[-self.hist_max:]
+        if self.hist_max:
+            self.state_hist.append({
+                'elapsed': elapsed,
+                'state': state,
+            })
+            self.state_hist = self.state_hist[-self.hist_max:]
         return self.state_hist
-    
-    def update(self, elapsed, time_counter, **kwargs) -> AParameters:
-        self.update_state(elapsed, time_counter, **kwargs)
+
+    def update(self, elapsed, time_counter, **kwargs) -> float:
+        """
+        returns 
+        > 0: animation is active
+        >= 1: animation just finished its complete duration
+        < 0: animation is in interval
+        <= -1: animation just finished its interval, and will start in the next frame
+        == 0.0: animation is continuous
+        """
+        triggers = self.update_state(elapsed, time_counter, **kwargs)
         state = self.get_parameters()
         self.state_add(state, elapsed)
-        return self.get_parameters_w()
+        return triggers
 
     def get_parameters(self) -> AParameters:
         """
@@ -391,7 +414,7 @@ class Animation(Buildable):
         cooldown.trigger(time_counter, check=False)
         self.cooldowns[f'{typ}_i'] = cooldown
         return cooldown
-    
+
     def set_time_multiplier(self, typ, value):
         delta = value / self.time_multipliers[typ]
         self.cooldowns[typ + "_i"] *= delta
@@ -409,14 +432,22 @@ class Animation(Buildable):
                     # End animation
                     duration_cd.clear()
                     interval_cd = self.initCooldown('interval', time_counter)
-                    return
+                return (triggers + epsilon_f)
+            return 0.0
         else:
             triggers = interval_cd.trigger(time_counter)
             if triggers > 1:
                 # Start animation
                 interval_cd.clear()
                 duration_cd = self.initCooldown('duration', time_counter)
+            return -(triggers + epsilon_f)
 
+
+    def neutral(self) -> AParameters:
+        return AParameters()
+
+    def from_array(self, array: np.ndarray) -> AParameters:
+        return AParameters(array)
 
     def animate(self, elapsed, time_counter, **kwargs):
         """
@@ -425,6 +456,93 @@ class Animation(Buildable):
         """
         pass
 
+
+
+class Animation_keyframes(Animation):
+    def __init__(
+        self,
+        *args,
+        keyframes: Dict[float, AParameters],
+        dynamics: Dynamics | None = None,
+        **kwargs,
+    ):
+        self.keyframes = keyframes
+        self.dynamics = dynamics
+
+        self.keyframes = {
+            float(k): v
+            for k,v in self.keyframes.items()
+        }
+        self.cls_param = AParameters
+        for k, v in self.keyframes.items():
+            self.cls_param = v.__class__
+            break
+
+        if 0.0 not in self.keyframes:
+            self.keyframes[0.0] = self.neutral()
+
+        self.keyframes_timestamps = list(sorted(self.keyframes.keys()))
+
+        super().__init__(
+            *args,
+            duration=self.keyframes_timestamps[-1],
+            **kwargs
+        )
+
+        self.state = self.neutral()
+        self.init()
+
+        print("self.keyframes")
+        for k, v in self.keyframes.items():
+            print(f"{k}: {v}")
+            print(f"{type(k)}: {type(v)}")
+        print(list(self.keyframes.keys()), "list(self.keyframes.keys())")
+        print(self.keyframes_timestamps, "self.keyframes_timestamps")
+        print(self.duration, "self.duration")
+        print(self.cooldowns['duration'], "self.cooldowns['duration']")
+        print(self.cooldowns['duration_i'], "self.cooldowns['duration_i']")
+
+    def neutral(self):
+        return self.cls_param()
+
+    def from_array(self, array: np.ndarray) -> AParameters:
+        return self.cls_param(array)
+
+    def init(self):
+        self.keyframe_idx = 0
+        if self.dynamics:
+            self.dynamics.init(self.neutral().array)
+
+    def animate(self, elapsed, time_counter, **kwargs):
+        elapsed_p = self.elapsed_percent(time_counter)
+        seconds = self.elapsed_seconds(time_counter)
+
+        print(f"animate keyframe_idx = {self.keyframe_idx}  seconds = {seconds}   self.keyframe_idx + 1 < len(self.keyframes_timestamps) {self.keyframe_idx + 1} < {len(self.keyframes_timestamps)} ({self.keyframe_idx + 1 < len(self.keyframes_timestamps)})")
+
+        # Update current keyframe idx
+        while (self.keyframe_idx + 1 < len(self.keyframes_timestamps)
+               and seconds >= self.keyframes_timestamps[self.keyframe_idx + 1]
+               ):
+            self.keyframe_idx += 1
+
+        print(f"animate keyframe_idx = {self.keyframe_idx}")
+
+        # Get current keyframe
+        keyframe = self.get_keyframe()
+        if self.dynamics:
+            arr = self.dynamics.update(elapsed, keyframe.array)
+            print(f"{arr[24:]}  elapsed = {elapsed}")
+            self.state = self.from_array(arr)
+        else:
+            self.state = keyframe
+
+        if elapsed_p == 1.0:
+            self.init()
+
+    def get_keyframe(self):
+        keyframe_time = self.keyframes_timestamps[self.keyframe_idx]
+        print(f"{self.keyframes[keyframe_time].array[24:]} get_keyframe {self.keyframe_idx}  {keyframe_time}")
+        return self.keyframes[keyframe_time]
 
 
 @dataclass
@@ -445,10 +563,10 @@ class Changer:
             self.change_state(time_counter, triggers, **kwargs)
             return self.get()
         return None
-    
+
     def a(self, arg_name):
         return self.kwargs[arg_name]
-    
+
     @abstractmethod
     def change_state(self, time_counter, triggers=1.0, **kwargs):
         """should change self.state_idx"""
@@ -476,6 +594,7 @@ class AnimationStates:
         animations: Dict[str, Animation | Dict] | None = None,
         transitions: Dict[str, Dict[str, Transition | Tuple[Dict, Dict]]] | None = None,
         state_changes: Dict[str, Changer] | None = None,
+        dynamics: Dict[str, Dynamics | Dict[str, float]] | None = None,
         sentiments_args = None,
         sentiments: Dict[str, float] | None = None,
         **kwargs
@@ -484,7 +603,11 @@ class AnimationStates:
             animations = {}
 
         self.sentiment_animations: Dict[str, Dict[str, Animation]] = {}
+        "Animations that are directly related to sentiment"
+        self.animations_temp: Dict[str, Animation] = {}
+        "Animations that are removed after their duration expire"
         self.animations: Dict[str, Animation] = {}
+        "All animations by name"
         for animation_name, a in animations.items():
             if isinstance(a, Animation):
                 logger.info(f"Registered {animation_name}")
@@ -496,10 +619,10 @@ class AnimationStates:
                 sentiment = animation_name.split('_')[1]
                 if sentiment not in self.sentiment_animations:
                     self.sentiment_animations[sentiment] = {}
-                
+
                 self.sentiment_animations[sentiment][animation_name] = self.animations[animation_name]
                 self.animations[animation_name].weight = 0.0
-        
+
         logger.info(f"self.sentiment_animations {self.sentiment_animations}")
 
         transitions = transitions or {}
@@ -529,13 +652,11 @@ class AnimationStates:
             **(state_changes or {}),
         }
 
-        self.animations_by_type = {}
+        self.animations_by_type: Dict[str, set[str]] = defaultdict(lambda: set())
         for a_name, a in self.animations.items():
-            if a.typ not in self.animations_by_type:
-                self.animations_by_type[a.typ] = []
-            self.animations_by_type[a.typ].append(a_name)
+            self.animations_by_type[a.typ].add(a_name)
 
-        
+
         self.playing_types: Dict[str, set] = {}
         self.animation_name_to_changer_typ = {}
 
@@ -559,7 +680,14 @@ class AnimationStates:
 
         self.sentiments_args = sentiments_args or {}
         self.sentiments: Dict[str, float] = sentiments or {}
-    
+        
+        if not dynamics:
+            dynamics = {}
+        self.dynamics = {
+            k: get_dynamics(v)
+            for k, v in dynamics.items()
+        }
+
         self.transitioning: Dict[str, Dict[str, Dict[str, str]]] = {}
         self.transitions_active: Dict[str, Transition] = {}
 
@@ -579,10 +707,10 @@ class AnimationStates:
                 for var_name in ['duration_multiplier', 'transition_multiplier']:
                     if var_name in self.sentiments_args[sentiment]:
                         multipliers[var_name] *= self.sentiments_args[sentiment][var_name]
-        
+
         done = set()
-        for animations in [animations_in, animations_out]:
-            for a, transition_id in animations.items():
+        for animations_t in [animations_in, animations_out]:
+            for a, transition_id in animations_t.items():
                 if transition_id not in done:
                     transition = self.transitions_active[transition_id]
                     transition.cd *= multipliers['transition_multiplier']
@@ -605,7 +733,7 @@ class AnimationStates:
             if t in self.transitions['by_type']:
                 transition = self.transitions['by_type'][t]
                 break
-        
+
         for out_name in animations_out:
             if self.transitions and out_name in self.transitions:
                 if animation_name in self.transitions[out_name]:
@@ -625,9 +753,9 @@ class AnimationStates:
         if (typ in self.playing_types):
             if (animation_name in self.playing_types[typ]):
                 logger.info(f"Animation already playing {animation_name}")
-                # TODO refresh time_to_expire
+                # TODO refresh time_to_expire (?)
                 return
-            else: 
+            else:
                 if typ in self.transitioning:
                     if animation_name in self.transitioning[typ]['in']:
                         logger.info(f"Animation already transitioning {animation_name}")
@@ -635,7 +763,7 @@ class AnimationStates:
                 animations_out = self.playing_types[typ]
                 if not transition:
                     transition = self.get_transition_to(animations_out, animation_name)
-            
+
                 transition = copy.deepcopy(transition)
                 transition.doStart(time_counter)
                 transition_id = self.register_transition(transition)
@@ -643,11 +771,11 @@ class AnimationStates:
                 self.add_transition(typ, {animation_name: transition_id}, {a_name: transition_id for a_name in animations_out})
                 self.playing_types[typ].add(animation_name)
                 logger.info(f"self.playing_types[{typ}] = {self.playing_types[typ]}")
-    
 
-    def change_sentiments(self, sentiments):
+
+    def set_sentiments(self, sentiments):
         # get which sentiments are new, which are not in the new, and which remain
-        new = set(sentiments.keys()) - set(self.sentiments.keys()) 
+        new = set(sentiments.keys()) - set(self.sentiments.keys())
         removed = set(self.sentiments.keys()) - set(sentiments.keys())
         common = set(self.sentiments.keys()).intersection(set(sentiments.keys()))
 
@@ -661,9 +789,41 @@ class AnimationStates:
             if s_name in self.sentiment_animations.keys():
                 for a_name, a in self.sentiment_animations[s_name].items():
                     logger.info(f"Sentiment changed animation {a_name}.weight = {sentiments[s_name]}")
+                    # TODO transition instead, and overshoot
                     a.weight = sentiments[s_name]
 
         self.sentiments = sentiments
+
+    def set_dynamics(self, name, dynamic):
+        self.dynamics[name] = get_dynamics(dynamic)
+
+    def start_mouth_keyframes(self, mouth_keyframes):
+        a = Animation_keyframes(
+            typ='speaking',
+            keyframes=self.get_mouth_keyframes(mouth_keyframes),
+            dynamics=self.dynamics['mouth'],
+        )
+        self.start_temporary_animation('speaking', a)
+    
+        
+    def start_temporary_animation(self, name:str, a: Animation, override=True):
+        if not override:
+            if name in self.animations:
+                # Already exists
+                return
+        self.animations[name] = a
+        self.animations_temp[name] = a
+        self.animations_by_type[a.typ].add(name)
+
+    def remove_animation_temp(self, name:str, a: Animation):
+        del self.animations[name]
+        del self.animations_temp[name]
+        self.animations_by_type[a.typ].remove(name)
+
+    @abstractmethod
+    def get_mouth_keyframes(self, mouth_keyframes) -> Dict[float, AParameters]:
+        pass
+
 
     def update(self, time_counter = None):
         elapsed, time_counter = self.updateElapsed(time_counter)
@@ -672,7 +832,7 @@ class AnimationStates:
             animation_name = sc.update(time_counter)
             if animation_name:
                 self.change_animation(animation_name, typ, time_counter)
-        
+
         to_del = {}
         for typ, t in self.transitioning.items():
             to_del[typ] = {'out': set(), 'in': set()}
@@ -696,7 +856,7 @@ class AnimationStates:
                     changer_typ = self.animation_name_to_changer_typ[animation_name]
                     self.playing_types[changer_typ].remove(animation_name)
                     logger.info(f"Finished transition {animation_name}  self.playing_types[{changer_typ}] = {self.playing_types[changer_typ]}")
-            
+
             for animation_name, transition_id in t['in'].items():
                 weight = getW(transition_id)
                 self.getAnimation(animation_name).weight = weight
@@ -709,7 +869,7 @@ class AnimationStates:
                 for name in names:
                     logger.info(f"del self.transitioning[{typ}][{tr_typ}][{name}]")
                     del self.transitioning[typ][tr_typ][name]
-            
+
             # Finished all transitions
             if not self.transitioning[typ]['out'].keys() and not self.transitioning[typ]['in'].keys():
                 logger.info(f"Finished all transitions {typ}")
@@ -722,9 +882,11 @@ class AnimationStates:
                     del self.transitions_active[t_id]
 
 
-
-        for name, a in self.animations.items():
-            a.update(elapsed, time_counter)
+        for name  in self.get_animation_names():
+            a = self.animations[name]
+            triggers = a.update(elapsed, time_counter)
+            if triggers >= 1.0 and name in self.animations_temp:
+                self.remove_animation_temp(name, a)
 
         return self.get()
 
@@ -734,9 +896,20 @@ class AnimationStates:
             parameters += a.get()
         return parameters
 
+    def get_animation_names(self):
+        """thread "safe" """
+        names = None
+        while names is None:
+            try:
+                names = list(self.animations.keys())
+            except:
+                pass
+        return names
+
     def getAnimationsActive(self):
         # TODO change entire code to keep track of these in `self.playing_types` instead
-        for name, a in self.animations.items():
+        for name  in self.get_animation_names():
+            a = self.animations[name]
             if a.isActive():
                 yield name, a
 
@@ -746,7 +919,7 @@ class AnimationStates:
         elapsed = time_counter - self.time_counter_last
         self.time_counter_last = time_counter
         return elapsed, time_counter
-    
+
     def getAnimation(self, animation_name):
         return self.animations[animation_name]
 
