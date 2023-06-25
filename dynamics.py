@@ -65,7 +65,7 @@ class SecondOrderDynamics(Dynamics):
 			self.T_crit *= 0.8
 
 		# Initialize variables
-		if x0:
+		if x0 is not None:
 			self.init(x0)
 
 	def init(self, x0: np.ndarray):
