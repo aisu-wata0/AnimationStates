@@ -252,7 +252,7 @@ class Transition:
             cd=CooldownVarU.build(cd),
         )
 
-
+@dataclass
 class AParameters:
     """
     An abstract base class.
@@ -261,31 +261,70 @@ class AParameters:
         - multiplied by a scalar
     """
     array: np.ndarray
+    parameter_count: int = 1
 
-    def __init__(self, array: np.ndarray | None = None):
-        if array is not None:
+    def __init__(self, array: np.ndarray | dict[str, float] | list[float] | None = None):
+        if array is None:
+            array = np.array([0.0] * self.__class__.parameter_count)
+        if isinstance(array, np.ndarray):
             self.array = array
+        elif isinstance(array, list):
+            array = np.array(array)
+        elif isinstance(array, dict):
+            self.__init__()
+            for k, v in array.items():
+                self[k] = v
+        else:
+            raise NotImplementedError()
+
+    def __setitem__(self, key: str | int, value):
+        if isinstance(key, int):
+            self.array[key] = value
+        elif isinstance(key, str):
+            self.array[self.get_parameter_index(key)] = value
+        else:
+            raise KeyError(f'Invalid key type {type(key)}')
 
     @abstractmethod
+    def get_parameter_index(self, pose_parameter_name: str) -> int:
+        pass
+
     def __add__(self, other: 'AParameters') -> 'AParameters':
         """Addition method, between objects of this class."""
-        pass
+        return self.__class__(self.array + other.array)
 
-    @abstractmethod
     def __radd__(self, other: 'AParameters') -> 'AParameters':
         """Addition method with reflected operands, between objects of this class."""
-        pass
+        return self.__class__(other.array + self.array)
 
-    @abstractmethod
     def __mul__(self, scalar: float) -> 'AParameters':
         """Multiplication method."""
-        pass
+        return self.__class__(self.array * scalar)
 
-    @abstractmethod
     def __rmul__(self, scalar: float) -> 'AParameters':
         """Multiplication method with reflected operands."""
-        pass
+        return self.__class__(self.array * scalar)
 
+    @classmethod
+    def from_list(cls, param_list: List[Dict[str, float]|List[float]]) -> list['AParameters']:
+        """
+        Animation_tha.states_from_list([
+            {'eyebrow_happy_left': 1.0},
+            {'eyebrow_happy_right': 1.0},
+        ])
+        """
+        s_list: list['AParameters'] = []
+        if len(param_list) == 0:
+            return s_list
+        if (isinstance(param_list[0], dict) or
+            isinstance(param_list[0], list) or
+            isinstance(param_list[0], np.ndarray)
+        ):
+            for s in param_list:
+                s_list.append(cls(s))
+        else: 
+            raise NotImplementedError()
+        return s_list
 
 
 class Animation(Buildable):
